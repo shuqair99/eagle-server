@@ -11,7 +11,7 @@ CORS(app)
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
 
-DB_FILE = "eagle_drm.db"
+DB_FILE = "/tmp/eagle_drm.db"
 
 
 def get_db_connection():
@@ -159,6 +159,7 @@ def heartbeat():
         return jsonify({"status": "pending"})
     else:
         return jsonify({"status": "active"})
+
 
 
 init_db()
