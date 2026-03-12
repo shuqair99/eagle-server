@@ -1,12 +1,46 @@
 import sqlite3
 import datetime
-import requests
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
+from functools import wraps
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
+# ======================
+# ADMIN LOGIN
+# ======================
+
+ADMIN_USER = "shuqair99"
+ADMIN_PASS = "@LoLo9975@"
+
+
+def check_auth(username, password):
+    return username == ADMIN_USER and password == ADMIN_PASS
+
+
+def authenticate():
+    return Response(
+        "Login Required",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Admin Login"'}
+    )
+
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ======================
+# SERVER CONFIG
+# ======================
 
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
@@ -14,152 +48,340 @@ log.setLevel(logging.ERROR)
 DB_FILE = "/tmp/eagle_drm.db"
 
 
-def get_db_connection():
+def db():
     return sqlite3.connect(DB_FILE)
 
 
-def column_exists(cursor, table_name, column_name):
-    cursor.execute(f"PRAGMA table_info({table_name})")
-    cols = cursor.fetchall()
-    for col in cols:
-        if col[1] == column_name:
-            return True
-    return False
-
+# ======================
+# DATABASE
+# ======================
 
 def init_db():
-    conn = get_db_connection()
+
+    conn = db()
     c = conn.cursor()
 
     c.execute("""
-        CREATE TABLE IF NOT EXISTS devices (
-            device_id TEXT PRIMARY KEY,
-            ip_address TEXT,
-            country TEXT,
-            active_server TEXT,
-            now_playing TEXT,
-            device_model TEXT,
-            last_seen TEXT,
-            is_active INTEGER DEFAULT 0,
-            is_blocked INTEGER DEFAULT 0
-        )
+    CREATE TABLE IF NOT EXISTS devices(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT UNIQUE,
+        server TEXT,
+        model TEXT,
+        ip TEXT,
+        created_at TEXT,
+        last_seen TEXT,
+        is_active INTEGER DEFAULT 0,
+        is_blocked INTEGER DEFAULT 0,
+        expires_at TEXT
+    )
     """)
-
-    if not column_exists(c, "devices", "expires_at"):
-        c.execute("ALTER TABLE devices ADD COLUMN expires_at TEXT")
 
     conn.commit()
     conn.close()
 
 
-def get_real_ip():
-    forwarded_for = request.headers.get("X-Forwarded-For", "")
-    real_ip = request.headers.get("X-Real-IP", "")
-    cf_ip = request.headers.get("CF-Connecting-IP", "")
+# ======================
+# EXPIRE CHECK
+# ======================
 
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    if real_ip:
-        return real_ip.strip()
-    if cf_ip:
-        return cf_ip.strip()
-    return request.remote_addr or "Unknown"
+def expired(date):
 
-
-def is_expired(expires_at):
-    if not expires_at:
+    if not date:
         return False
-    try:
-        exp = datetime.datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
-        return datetime.datetime.now() > exp
-    except:
-        try:
-            exp = datetime.datetime.strptime(expires_at, "%Y-%m-%d")
-            return datetime.datetime.now().date() > exp.date()
-        except:
-            return False
+
+    return datetime.datetime.utcnow() > datetime.datetime.fromisoformat(date)
 
 
-@app.route("/", methods=["GET"])
+# ======================
+# HOME
+# ======================
+
+@app.route("/")
 def home():
-    return jsonify({"status": "ok", "service": "eagle-server"})
+    return "Eagle DRM Server Online"
 
 
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return jsonify({"status": "healthy"})
+# ======================
+# API
+# ======================
 
+@app.route("/api")
+def api():
 
-@app.route("/api", methods=["GET"])
-def heartbeat():
-    device_id = request.args.get("device")
-    server_name = request.args.get("server", "غير محدد")
-    now_playing = request.args.get("playing", "يتصفح القوائم...")
-    device_model = request.args.get("model", "غير معروف")
+    device = request.args.get("device")
+    server = request.args.get("server")
+    model = request.args.get("model")
 
-    if not device_id:
-        return jsonify({"error": "No device ID"}), 400
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
 
-    ip_address = get_real_ip()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not device:
+        return jsonify({"error": "device missing"})
 
-    conn = get_db_connection()
+    conn = db()
     c = conn.cursor()
+
     c.execute(
-        "SELECT is_active, is_blocked, country, expires_at FROM devices WHERE device_id=?",
-        (device_id,)
+        "SELECT is_active,is_blocked,expires_at FROM devices WHERE device_id=?",
+        (device,)
     )
+
     row = c.fetchone()
 
-    is_active = 0
-    is_blocked = 0
-    country = "Unknown"
-    expires_at = None
+    now = datetime.datetime.utcnow().isoformat()
 
-    if row:
-        is_active = row[0]
-        is_blocked = row[1]
-        country = row[2]
-        expires_at = row[3]
-    else:
-        try:
-            if ip_address not in ["127.0.0.1", "::1", "Unknown"]:
-                res = requests.get(f"http://ip-api.com/json/{ip_address}", timeout=2).json()
-                country = res.get("country", "Unknown")
-            else:
-                country = "Localhost"
-        except:
-            pass
+    if not row:
 
-    c.execute("""
-        INSERT INTO devices (
-            device_id, ip_address, country, active_server, now_playing,
-            device_model, last_seen, is_active, is_blocked, expires_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(device_id) DO UPDATE SET
-            ip_address=excluded.ip_address,
-            active_server=excluded.active_server,
-            now_playing=excluded.now_playing,
-            device_model=excluded.device_model,
-            last_seen=excluded.last_seen
-    """, (
-        device_id, ip_address, country, server_name, now_playing,
-        device_model, now, is_active, is_blocked, expires_at
-    ))
+        c.execute("""
+        INSERT INTO devices(device_id,server,model,ip,created_at,last_seen)
+        VALUES(?,?,?,?,?,?)
+        """, (
+            device,
+            server,
+            model,
+            ip,
+            now,
+            now
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({"status": "pending"})
+
+    is_active, is_blocked, exp = row
+
+    c.execute(
+        "UPDATE devices SET last_seen=? WHERE device_id=?",
+        (now, device)
+    )
 
     conn.commit()
     conn.close()
 
     if is_blocked:
         return jsonify({"status": "blocked", "action": "wipe_data"})
-    elif is_expired(expires_at):
+
+    if expired(exp):
         return jsonify({"status": "expired"})
-    elif not is_active:
+
+    if not is_active:
         return jsonify({"status": "pending"})
-    else:
-        return jsonify({"status": "active"})
+
+    return jsonify({"status": "active"})
 
 
+# ======================
+# ADMIN DASHBOARD
+# ======================
+
+@app.route("/admin")
+@requires_auth
+def admin():
+
+    conn = db()
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM devices ORDER BY id DESC")
+
+    rows = c.fetchall()
+
+    html = """
+    <html>
+    <head>
+    <title>Eagle Admin</title>
+
+    <style>
+
+    body{
+        background:#0f172a;
+        font-family:Arial;
+        color:white;
+        padding:40px
+    }
+
+    table{
+        border-collapse:collapse;
+        width:100%
+    }
+
+    td,th{
+        border:1px solid #1e293b;
+        padding:10px;
+        text-align:center
+    }
+
+    th{
+        background:#1e293b
+    }
+
+    tr:hover{
+        background:#1e293b
+    }
+
+    a{
+        color:#38bdf8;
+        text-decoration:none;
+        font-weight:bold
+    }
+
+    h1{
+        margin-bottom:20px
+    }
+
+    </style>
+
+    </head>
+
+    <body>
+
+    <h1>Eagle DRM Dashboard</h1>
+
+    <table>
+
+    <tr>
+    <th>ID</th>
+    <th>Device</th>
+    <th>Server</th>
+    <th>Model</th>
+    <th>IP</th>
+    <th>Status</th>
+    <th>Expire</th>
+    <th>Last Seen</th>
+    <th>Actions</th>
+    </tr>
+    """
+
+    for r in rows:
+
+        (
+            id,
+            device,
+            server,
+            model,
+            ip,
+            created,
+            last,
+            active,
+            blocked,
+            exp
+        ) = r
+
+        if blocked:
+            status = "BLOCKED"
+        elif active:
+            status = "ACTIVE"
+        else:
+            status = "PENDING"
+
+        html += f"""
+
+        <tr>
+
+        <td>{id}</td>
+        <td>{device}</td>
+        <td>{server}</td>
+        <td>{model}</td>
+        <td>{ip}</td>
+        <td>{status}</td>
+        <td>{exp if exp else "-"}</td>
+        <td>{last}</td>
+
+        <td>
+
+        <a href='/activate?device={device}'>Activate</a> |
+
+        <a href='/block?device={device}'>Block</a> |
+
+        <a href='/extend?device={device}&days=30'>+30d</a>
+
+        </td>
+
+        </tr>
+        """
+
+    html += "</table></body></html>"
+
+    conn.close()
+
+    return html
+
+
+# ======================
+# ACTIVATE
+# ======================
+
+@app.route("/activate")
+@requires_auth
+def activate():
+
+    device = request.args.get("device")
+
+    conn = db()
+    c = conn.cursor()
+
+    c.execute(
+        "UPDATE devices SET is_active=1 WHERE device_id=?",
+        (device,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return "Device Activated"
+
+
+# ======================
+# BLOCK
+# ======================
+
+@app.route("/block")
+@requires_auth
+def block():
+
+    device = request.args.get("device")
+
+    conn = db()
+    c = conn.cursor()
+
+    c.execute(
+        "UPDATE devices SET is_blocked=1 WHERE device_id=?",
+        (device,)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return "Device Blocked"
+
+
+# ======================
+# EXTEND
+# ======================
+
+@app.route("/extend")
+@requires_auth
+def extend():
+
+    device = request.args.get("device")
+
+    days = int(request.args.get("days", 30))
+
+    conn = db()
+    c = conn.cursor()
+
+    expire = datetime.datetime.utcnow() + datetime.timedelta(days=days)
+
+    c.execute(
+        "UPDATE devices SET expires_at=? WHERE device_id=?",
+        (expire.isoformat(), device)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return f"Extended {days} days"
+
+
+# ======================
 
 init_db()
