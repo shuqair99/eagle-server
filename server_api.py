@@ -34,7 +34,7 @@ def requires_auth(f):
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
 
-DB_FILE = "/tmp/eagle_drm.db"
+DB_FILE = "eagle_drm.db"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def db():
@@ -365,3 +365,4 @@ def delete():
     return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
 init_db()
+
