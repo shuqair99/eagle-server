@@ -1,12 +1,11 @@
-# --- الكود الجديد والمحدث للوحة EAGLE مع الأعلام ---
-import sqlite3
 import datetime
 import logging
+import os
 import requests
+import psycopg2
 from functools import wraps
 from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
-import os
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -37,10 +36,10 @@ log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "eagle_drm.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def db():
-    return sqlite3.connect(DB_FILE)
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
     conn = db()
@@ -48,7 +47,7 @@ def init_db():
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS devices(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         device_id TEXT UNIQUE,
         server TEXT,
         model TEXT,
@@ -64,32 +63,30 @@ def init_db():
     )
     """)
 
-    c.execute("PRAGMA table_info(devices)")
-    columns = [info[1] for info in c.fetchall()]
-
-    # Migration آمنة بدون مسح الجدول القديم
-    if 'device_type' not in columns:
-        c.execute("ALTER TABLE devices ADD COLUMN device_type TEXT")
-    if 'country' not in columns:
-        c.execute("ALTER TABLE devices ADD COLUMN country TEXT")
-    if 'flag' not in columns:
-        c.execute("ALTER TABLE devices ADD COLUMN flag TEXT")
-
     conn.commit()
+    c.close()
     conn.close()
 
 def expired(date):
     if not date:
         return False
-    return datetime.datetime.utcnow() > datetime.datetime.fromisoformat(date)
+    try:
+        return datetime.datetime.utcnow() > datetime.datetime.fromisoformat(date)
+    except Exception:
+        return False
 
 def get_device_type(user_agent):
-    ua = user_agent.lower()
-    if any(tv in ua for tv in ['smart-tv', 'tizen', 'webos', 'appletv']): return "Smart TV"
-    if 'android' in ua: return "Android (Mobile/Box)"
-    if any(ios in ua for ios in ['iphone', 'ipad']): return "iOS Device"
-    if 'windows' in ua: return "Windows PC"
-    if 'macintosh' in ua: return "Mac"
+    ua = (user_agent or "").lower()
+    if any(tv in ua for tv in ['smart-tv', 'tizen', 'webos', 'appletv']):
+        return "Smart TV"
+    if 'android' in ua:
+        return "Android (Mobile/Box)"
+    if any(ios in ua for ios in ['iphone', 'ipad']):
+        return "iOS Device"
+    if 'windows' in ua:
+        return "Windows PC"
+    if 'macintosh' in ua or 'mac os' in ua:
+        return "Mac"
     return "Unknown Device"
 
 def get_geo_info(ip):
@@ -120,7 +117,7 @@ def api():
     device = request.args.get("device")
     server = request.args.get("server")
     model = request.args.get("model")
-    
+
     raw_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     ip = raw_ip.split(',')[0].strip() if raw_ip else ""
 
@@ -132,7 +129,7 @@ def api():
 
     conn = db()
     c = conn.cursor()
-    c.execute("SELECT is_active, is_blocked, expires_at FROM devices WHERE device_id=?", (device,))
+    c.execute("SELECT is_active, is_blocked, expires_at FROM devices WHERE device_id=%s", (device,))
     row = c.fetchone()
     now = datetime.datetime.utcnow().isoformat()
 
@@ -140,20 +137,22 @@ def api():
         country, flag = get_geo_info(ip)
         c.execute("""
         INSERT INTO devices(device_id, server, model, device_type, ip, country, flag, created_at, last_seen)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (device, server, model, device_type, ip, country, flag, now, now))
         conn.commit()
+        c.close()
         conn.close()
         return jsonify({"status": "pending"})
 
     is_active, is_blocked, exp = row
     country, flag = get_geo_info(ip)
-    
+
     c.execute(
-        "UPDATE devices SET last_seen=?, server=?, model=?, device_type=?, ip=?, country=?, flag=? WHERE device_id=?",
+        "UPDATE devices SET last_seen=%s, server=%s, model=%s, device_type=%s, ip=%s, country=%s, flag=%s WHERE device_id=%s",
         (now, server, model, device_type, ip, country, flag, device)
     )
     conn.commit()
+    c.close()
     conn.close()
 
     if is_blocked:
@@ -169,7 +168,24 @@ def api():
 def admin():
     conn = db()
     c = conn.cursor()
-    c.execute("SELECT * FROM devices ORDER BY id DESC")
+    c.execute("""
+        SELECT
+            id,
+            device_id,
+            server,
+            model,
+            device_type,
+            ip,
+            country,
+            flag,
+            created_at,
+            last_seen,
+            is_active,
+            is_blocked,
+            expires_at
+        FROM devices
+        ORDER BY id DESC
+    """)
     rows = c.fetchall()
 
     total_devices = len(rows)
@@ -213,6 +229,8 @@ def admin():
     .btn:hover{transform:translateY(-1px);opacity:0.95;}
     .btn-activate{background:#16a34a;color:white;}
     .btn-block{background:#dc2626;color:white;}
+    .btn-unblock{background:#0ea5e9;color:white;}
+    .btn-deactivate{background:#475569;color:white;}
     .btn-extend{background:#d4af37;color:#111827;}
     .btn-delete{background:#7f1d1d;color:white;}
     .muted{color:#94a3b8;font-size:13px;}
@@ -277,9 +295,7 @@ def admin():
     html = html.replace("__EXPIRED__", str(expired_count))
 
     for r in rows:
-        (
-            row_id, device, server, model, device_type, ip, country, flag, created, last, active, blocked, exp
-        ) = r
+        row_id, device, server, model, device_type, ip, country, flag, created, last, active, blocked, exp = r
 
         if blocked:
             status_label = "BLOCKED"
@@ -311,8 +327,12 @@ def admin():
             <td>
                 <div class="actions">
                     <a class="btn btn-activate" href="/activate?device={device}">Activate</a>
+                    <a class="btn btn-deactivate" href="/deactivate?device={device}">Deactivate</a>
                     <a class="btn btn-block" href="/block?device={device}">Block</a>
+                    <a class="btn btn-unblock" href="/unblock?device={device}">Unblock</a>
+                    <a class="btn btn-extend" href="/extend?device={device}&days=7">+7d</a>
                     <a class="btn btn-extend" href="/extend?device={device}&days=30">+30d</a>
+                    <a class="btn btn-extend" href="/extend?device={device}&days=365">+365d</a>
                     <a class="btn btn-delete" href="/delete?device={device}">Delete</a>
                 </div>
             </td>
@@ -327,6 +347,8 @@ def admin():
     </body>
     </html>
     """
+
+    c.close()
     conn.close()
     return html
 
@@ -336,8 +358,21 @@ def activate():
     device = request.args.get("device")
     conn = db()
     c = conn.cursor()
-    c.execute("UPDATE devices SET is_active=1, is_blocked=0 WHERE device_id=?", (device,))
+    c.execute("UPDATE devices SET is_active=1, is_blocked=0 WHERE device_id=%s", (device,))
     conn.commit()
+    c.close()
+    conn.close()
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
+
+@app.route("/deactivate")
+@requires_auth
+def deactivate():
+    device = request.args.get("device")
+    conn = db()
+    c = conn.cursor()
+    c.execute("UPDATE devices SET is_active=0 WHERE device_id=%s", (device,))
+    conn.commit()
+    c.close()
     conn.close()
     return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
@@ -347,8 +382,21 @@ def block():
     device = request.args.get("device")
     conn = db()
     c = conn.cursor()
-    c.execute("UPDATE devices SET is_blocked=1, is_active=0 WHERE device_id=?", (device,))
+    c.execute("UPDATE devices SET is_blocked=1, is_active=0 WHERE device_id=%s", (device,))
     conn.commit()
+    c.close()
+    conn.close()
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
+
+@app.route("/unblock")
+@requires_auth
+def unblock():
+    device = request.args.get("device")
+    conn = db()
+    c = conn.cursor()
+    c.execute("UPDATE devices SET is_blocked=0 WHERE device_id=%s", (device,))
+    conn.commit()
+    c.close()
     conn.close()
     return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
@@ -360,8 +408,9 @@ def extend():
     conn = db()
     c = conn.cursor()
     expire = datetime.datetime.utcnow() + datetime.timedelta(days=days)
-    c.execute("UPDATE devices SET expires_at=? WHERE device_id=?", (expire.isoformat(), device))
+    c.execute("UPDATE devices SET expires_at=%s WHERE device_id=%s", (expire.isoformat(), device))
     conn.commit()
+    c.close()
     conn.close()
     return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
@@ -371,15 +420,14 @@ def delete():
     device = request.args.get("device")
     conn = db()
     c = conn.cursor()
-    c.execute("DELETE FROM devices WHERE device_id=?", (device,))
+    c.execute("DELETE FROM devices WHERE device_id=%s", (device,))
     conn.commit()
+    c.close()
     conn.close()
     return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
 init_db()
 
 if __name__ == "__main__":
-    # Render بيحدد الـ Port أوتوماتيك من خلال متغير البيئة
     port = int(os.environ.get("PORT", 10000))
-    # تشغيل السيرفر على العنوان العام 0.0.0.0
     app.run(host="0.0.0.0", port=port)
