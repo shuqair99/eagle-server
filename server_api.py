@@ -1,3 +1,4 @@
+# --- الكود الجديد والمحدث للوحة EAGLE مع الأعلام ---
 import sqlite3
 import datetime
 import logging
@@ -44,6 +45,12 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
+    # تحديث ذكي: بيمسح الجدول القديم لو مفيش فيه خانة البلد عشان ميعملش إيرور
+    c.execute("PRAGMA table_info(devices)")
+    columns = [info[1] for info in c.fetchall()]
+    if 'country' not in columns and len(columns) > 0:
+        c.execute("DROP TABLE devices")
+        
     c.execute("""
     CREATE TABLE IF NOT EXISTS devices(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,16 +125,12 @@ def api():
 
     conn = db()
     c = conn.cursor()
-    c.execute(
-        "SELECT is_active, is_blocked, expires_at FROM devices WHERE device_id=?",
-        (device,)
-    )
+    c.execute("SELECT is_active, is_blocked, expires_at FROM devices WHERE device_id=?", (device,))
     row = c.fetchone()
     now = datetime.datetime.utcnow().isoformat()
 
     if not row:
         country, flag = get_geo_info(ip)
-        
         c.execute("""
         INSERT INTO devices(device_id, server, model, device_type, ip, country, flag, created_at, last_seen)
         VALUES(?,?,?,?,?,?,?,?,?)
@@ -268,19 +271,7 @@ def admin():
 
     for r in rows:
         (
-            row_id,
-            device,
-            server,
-            model,
-            device_type,
-            ip,
-            country,
-            flag,
-            created,
-            last,
-            active,
-            blocked,
-            exp
+            row_id, device, server, model, device_type, ip, country, flag, created, last, active, blocked, exp
         ) = r
 
         if blocked:
@@ -329,7 +320,6 @@ def admin():
     </body>
     </html>
     """
-
     conn.close()
     return html
 
