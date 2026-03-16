@@ -36,8 +36,8 @@ def requires_auth(f):
 log = logging.getLogger("werkzeug")
 log.setLevel(logging.ERROR)
 
-DB_FILE = "/tmp/eagle_drm.db"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "eagle_drm.db")
 
 def db():
     return sqlite3.connect(DB_FILE)
@@ -45,12 +45,7 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
-    # تحديث ذكي: بيمسح الجدول القديم لو مفيش فيه خانة البلد عشان ميعملش إيرور
-    c.execute("PRAGMA table_info(devices)")
-    columns = [info[1] for info in c.fetchall()]
-    if 'country' not in columns and len(columns) > 0:
-        c.execute("DROP TABLE devices")
-        
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS devices(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,6 +63,18 @@ def init_db():
         expires_at TEXT
     )
     """)
+
+    c.execute("PRAGMA table_info(devices)")
+    columns = [info[1] for info in c.fetchall()]
+
+    # Migration آمنة بدون مسح الجدول القديم
+    if 'device_type' not in columns:
+        c.execute("ALTER TABLE devices ADD COLUMN device_type TEXT")
+    if 'country' not in columns:
+        c.execute("ALTER TABLE devices ADD COLUMN country TEXT")
+    if 'flag' not in columns:
+        c.execute("ALTER TABLE devices ADD COLUMN flag TEXT")
+
     conn.commit()
     conn.close()
 
