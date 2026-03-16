@@ -9,7 +9,7 @@ from flask_cors import CORS
 import os
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 ADMIN_USER = "shuqair99"
 ADMIN_PASS = "@LoLo9975@"
