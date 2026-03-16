@@ -1,338 +1,382 @@
-window.EAGLE_APP_CONFIG = {
-  defaultUserAgent: "Mozilla/5.0 (Linux; Android 12; SmartTV; AFTMM Build/PS7655.3516N; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 Safari/537.36 EagleIPTV/2.0",
-  appVersion: "1.0.0" // <-- ضفنا رقم الإصدار هنا
-};
+import sqlite3
+import datetime
+import logging
+import requests
+from functools import wraps
+from flask import Flask, request, jsonify, Response, send_from_directory
+from flask_cors import CORS
+import os
 
-// ==========================================
-// 1. THE EAGLE - Server & App Logic
-// ==========================================
-(function () {
-  var KEY = 'active_server_data';
-  var FULL_KEY = 'active_server_full_data';
-  var cfg = window.EAGLE_APP_CONFIG || {};
+app = Flask(__name__)
+CORS(app)
 
-  function safeGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
-  function safeSet(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
-  function safeRemove(key) { try { localStorage.removeItem(key); } catch (e) {} }
-  function parseJson(raw) { if (!raw) return null; try { return JSON.parse(raw); } catch (e) { return null; } }
+ADMIN_USER = "shuqair99"
+ADMIN_PASS = "@LoLo9975@"
 
-  function getQueryParam(name) {
-    var search, parts, i, pair, key, val;
-    try {
-      search = window.location.search || '';
-      if (!search || search.length < 2) return '';
-      parts = search.substring(1).split('&');
-      for (i = 0; i < parts.length; i++) {
-        pair = parts[i].split('=');
-        key = decodeURIComponent(pair[0] || '');
-        if (key === name) {
-          val = decodeURIComponent(pair[1] || '');
-          return val;
-        }
-      }
-    } catch (e) {}
-    return '';
-  }
+def check_auth(username, password):
+    return username == ADMIN_USER and password == ADMIN_PASS
 
-  function bridgeAvailable() { return !!(window.EagleBridge && typeof window.EagleBridge.getProvidersData === 'function'); }
-  function bridgeGetProvidersData() { if (!bridgeAvailable()) return null; try { return parseJson(window.EagleBridge.getProvidersData()); } catch (e) { return null; } }
-  function bridgeGetActiveServer() { if (!window.EagleBridge) return null; try { if (typeof window.EagleBridge.getActiveServer === 'function') { return parseJson(window.EagleBridge.getActiveServer()); } } catch (e) {} return null; }
-  function bridgePersistServer(server) { if (!window.EagleBridge) return; try { if (typeof window.EagleBridge.persistServer === 'function') { window.EagleBridge.persistServer(JSON.stringify(server)); } } catch (e) {} }
+def authenticate():
+    return Response(
+        "Login Required",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Admin Login"'}
+    )
 
-  function normalizeServer(server) {
-    var host, username, password, title, key, subtitle, liveExt, userAgent;
-    if (!server || typeof server !== 'object') return null;
-    host = server.host || server.current_host || '';
-    username = server.username || server.user || server.current_user || '';
-    password = server.password || server.pass || server.current_pass || '';
-    if (!host || !username || !password) return null;
-    key = server.key || server.active_server_key || '';
-    title = server.title || server.name || key || '';
-    subtitle = server.subtitle || '';
-    liveExt = server.live_ext || server.current_live_ext || 'm3u8';
-    userAgent = server.user_agent || safeGet('eagle_user_agent') || cfg.defaultUserAgent || '';
-    return { key: key, title: title, subtitle: subtitle, host: host, username: username, password: password, live_ext: liveExt, user_agent: userAgent };
-  }
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
 
-  function persistServer(server) {
-    var normalized = normalizeServer(server);
-    if (!normalized) return null;
-    bridgePersistServer(normalized);
-    safeSet(KEY, JSON.stringify(normalized));
-    safeSet(FULL_KEY, JSON.stringify(normalized));
-    safeSet('active_server_title', normalized.title || normalized.key || '');
-    safeSet('current_host', normalized.host);
-    safeSet('current_user', normalized.username);
-    safeSet('current_pass', normalized.password);
-    if (normalized.key) safeSet('active_server_key', normalized.key);
-    if (normalized.live_ext) safeSet('current_live_ext', normalized.live_ext);
-    else safeRemove('current_live_ext');
-    if (normalized.user_agent) safeSet('eagle_user_agent', normalized.user_agent);
-    return normalized;
-  }
+log = logging.getLogger("werkzeug")
+log.setLevel(logging.ERROR)
 
-  function getPersistedServer() {
-    var bridgeServer = normalizeServer(bridgeGetActiveServer());
-    var stored;
-    if (bridgeServer) return bridgeServer;
-    stored = parseJson(safeGet(KEY)) || parseJson(safeGet(FULL_KEY));
-    return normalizeServer(stored);
-  }
+DB_FILE = "/tmp/eagle_drm.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-  function getLegacyCurrentServer() {
-    return normalizeServer({
-      key: safeGet('active_server_key') || '',
-      title: safeGet('active_server_title') || '',
-      host: safeGet('current_host') || '',
-      username: safeGet('current_user') || '',
-      password: safeGet('current_pass') || '',
-      live_ext: safeGet('current_live_ext') || 'm3u8',
-      user_agent: safeGet('eagle_user_agent') || cfg.defaultUserAgent || ''
-    });
-  }
+def db():
+    return sqlite3.connect(DB_FILE)
 
-  function getProvidersData() {
-    var bridgeData = bridgeGetProvidersData();
-    if (bridgeData && bridgeData.providers) return bridgeData;
-    return parseJson(safeGet('eagle_providers'));
-  }
+def init_db():
+    conn = db()
+    c = conn.cursor()
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS devices(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT UNIQUE,
+        server TEXT,
+        model TEXT,
+        device_type TEXT,
+        ip TEXT,
+        country TEXT,
+        flag TEXT,
+        created_at TEXT,
+        last_seen TEXT,
+        is_active INTEGER DEFAULT 0,
+        is_blocked INTEGER DEFAULT 0,
+        expires_at TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
 
-  function getProviderServerByKey(key, providersData) {
-    var providers, provider;
-    if (!key) return null;
-    providers = (providersData || getProvidersData() || {}).providers || {};
-    provider = providers[key];
-    if (!provider) return null;
-    return normalizeServer({ key: key, title: provider.title, subtitle: provider.subtitle, host: provider.host, username: provider.username, password: provider.password, live_ext: provider.live_ext, user_agent: provider.user_agent });
-  }
+def expired(date):
+    if not date:
+        return False
+    return datetime.datetime.utcnow() > datetime.datetime.fromisoformat(date)
 
-  function resolveCurrentServer(fallback, providersData) {
-    var queryKey = getQueryParam('server');
-    var activeKey = safeGet('active_server_key') || '';
-    var persisted = getPersistedServer();
-    var legacy = getLegacyCurrentServer();
-    var fallbackNormalized = normalizeServer(fallback);
-    var fromProviders;
-    providersData = providersData || getProvidersData();
+def get_device_type(user_agent):
+    ua = user_agent.lower()
+    if any(tv in ua for tv in ['smart-tv', 'tizen', 'webos', 'appletv']): return "Smart TV"
+    if 'android' in ua: return "Android (Mobile/Box)"
+    if any(ios in ua for ios in ['iphone', 'ipad']): return "iOS Device"
+    if 'windows' in ua: return "Windows PC"
+    if 'macintosh' in ua: return "Mac"
+    return "Unknown Device"
 
-    if (queryKey) { fromProviders = getProviderServerByKey(queryKey, providersData); if (fromProviders) return persistServer(fromProviders); }
-    if (activeKey) { fromProviders = getProviderServerByKey(activeKey, providersData); if (fromProviders) return persistServer(fromProviders); }
-    if (persisted) { if (persisted.key) { fromProviders = getProviderServerByKey(persisted.key, providersData); if (fromProviders) return persistServer(fromProviders); } return persistServer(persisted); }
-    if (legacy) { if (legacy.key) { fromProviders = getProviderServerByKey(legacy.key, providersData); if (fromProviders) return persistServer(fromProviders); } return persistServer(legacy); }
-    if (fallbackNormalized && fallbackNormalized.key) { fromProviders = getProviderServerByKey(fallbackNormalized.key, providersData); if (fromProviders) return persistServer(fromProviders); }
-    if (fallbackNormalized) return persistServer(fallbackNormalized);
-    return null;
-  }
+def get_geo_info(ip):
+    if not ip or ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('127.'):
+        return "Local Network", "🏠"
+    try:
+        resp = requests.get(f"http://ip-api.com/json/{ip}?fields=country,countryCode", timeout=2)
+        if resp.status_code == 200:
+            data = resp.json()
+            country = data.get("country", "Unknown")
+            cc = data.get("countryCode", "UN")
+            flag = "".join(chr(ord(c) + 127397) for c in cc) if cc != "UN" else "🏳️"
+            return country, flag
+    except Exception:
+        pass
+    return "Unknown", "🏳️"
 
-  function getServerOrFallback(fallback) { return resolveCurrentServer(fallback, getProvidersData()); }
-  function navigateWithServer(url) {
-    var s = resolveCurrentServer(null, getProvidersData()) || getPersistedServer();
-    if (s && s.key) { url += (url.indexOf('?') === -1 ? '?' : '&') + 'server=' + encodeURIComponent(s.key); }
-    window.location.href = url;
-  }
+@app.route("/banner.png")
+def banner():
+    return send_from_directory(BASE_DIR, "banner.png")
 
-  window.EagleServer = { normalizeServer: normalizeServer, persistServer: persistServer, getPersistedServer: getPersistedServer, getLegacyCurrentServer: getLegacyCurrentServer, getProvidersData: getProvidersData, getProviderServerByKey: getProviderServerByKey, resolveCurrentServer: resolveCurrentServer, getServerOrFallback: getServerOrFallback, navigateWithServer: navigateWithServer };
-})();
+@app.route("/")
+def home():
+    return jsonify({"status": "ok", "service": "eagle-server"})
 
-// ==========================================
-// 2. THE EAGLE - Unified Strict DRM & Activation System
-// ==========================================
-(function () {
-  var adminApiUrl = 'https://eagle-server-1.onrender.com/api';
-  var isAppUnlocked = false; 
-  var heartbeatTimer = null;
-  var failedAttempts = 0; // <-- متغير لعد مرات فشل الاتصال
-
-  // الدالة الأساسية لتوليد وتثبيت الـ ID مع حماية ضد التلاعب
-  function getEagleDeviceID() {
-    var id = localStorage.getItem('eagle_hardware_id');
-    if (!id) id = localStorage.getItem('device_id'); 
+@app.route("/api")
+def api():
+    device = request.args.get("device")
+    server = request.args.get("server")
+    model = request.args.get("model")
     
-    // التحقق من صحة الـ ID (Anti-Tampering)
-    if (id && (!id.startsWith('EAGLE-') || id.length < 10)) {
-        id = null; // مسح الـ ID لو ملعوب فيه
-    }
+    raw_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ip = raw_ip.split(',')[0].strip() if raw_ip else ""
 
-    if (!id) { 
-      id = 'EAGLE-' + Math.floor(Math.random() * 1000000000).toString(16).toUpperCase(); 
-      localStorage.setItem('eagle_hardware_id', id); 
-      localStorage.setItem('device_id', id); 
-    } else {
-      localStorage.setItem('eagle_hardware_id', id); 
-      localStorage.setItem('device_id', id); 
-    }
-    return id;
-  }
+    user_agent = request.headers.get("User-Agent", "")
+    device_type = get_device_type(user_agent)
 
-  function validText(value) { return !!(value && value !== 'None' && value !== 'null' && value !== 'undefined'); }
+    if not device:
+        return jsonify({"error": "device missing"})
 
-  function getActiveServerName() {
-    var helper = window.EagleServer;
-    var current, raw, obj, name;
-    if (helper && helper.getPersistedServer) {
-      current = helper.getPersistedServer();
-      if (current) { name = current.title || current.key || current.name || ''; if (validText(name)) return name; }
-    }
-    raw = localStorage.getItem('active_server_data') || localStorage.getItem('active_server_full_data');
-    if (raw) { try { obj = JSON.parse(raw); if (obj) { name = obj.title || obj.key || obj.name || ''; if (validText(name)) return name; } } catch (e) {} }
-    name = localStorage.getItem('active_server_title') || localStorage.getItem('active_server_key');
-    if (validText(name)) return name;
-    return 'Unknown';
-  }
+    conn = db()
+    c = conn.cursor()
+    c.execute(
+        "SELECT is_active, is_blocked, expires_at FROM devices WHERE device_id=?",
+        (device,)
+    )
+    row = c.fetchone()
+    now = datetime.datetime.utcnow().isoformat()
 
-  function getDeviceType() {
-    var stored = localStorage.getItem('device_model');
-    var raw = '';
-    try {
-      if (validText(stored)) raw = String(stored).toLowerCase();
-      else if (window.EAGLE_REAL_DEVICE) raw = String(window.EAGLE_REAL_DEVICE).toLowerCase();
-      else if (navigator && navigator.userAgent) raw = String(navigator.userAgent).toLowerCase();
-    } catch (e) {}
+    if not row:
+        country, flag = get_geo_info(ip)
+        
+        c.execute("""
+        INSERT INTO devices(device_id, server, model, device_type, ip, country, flag, created_at, last_seen)
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """, (device, server, model, device_type, ip, country, flag, now, now))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "pending"})
 
-    if (!raw) return 'جهاز غير معروف';
-    if (raw.indexOf('smarttv') !== -1 || raw.indexOf('smart-tv') !== -1 || raw.indexOf('hbbtv') !== -1 || raw.indexOf('webos') !== -1 || raw.indexOf('tizen') !== -1 || raw.indexOf('appletv') !== -1) return 'شاشة سمارت';
-    if (raw.indexOf('tv box') !== -1 || raw.indexOf('tvbox') !== -1 || raw.indexOf('androidtv') !== -1 || raw.indexOf('android tv') !== -1 || raw.indexOf('aft') !== -1 || raw.indexOf('fire tv') !== -1 || raw.indexOf('mibox') !== -1 || raw.indexOf('box') !== -1) return 'تي في بوكس';
-    if (raw.indexOf('iphone') !== -1 || raw.indexOf('ipad') !== -1 || raw.indexOf('ipod') !== -1) return 'موبايل iOS';
-    if (raw.indexOf('android') !== -1) { if (raw.indexOf('mobile') !== -1) return 'موبايل أندرويد'; return 'تي في بوكس'; }
-    if (raw.indexOf('windows') !== -1 || raw.indexOf('macintosh') !== -1 || raw.indexOf('linux') !== -1 || raw.indexOf('cros') !== -1) return 'كمبيوتر';
-    return 'جهاز غير معروف';
-  }
-
-  function handleSecurityScreen(type, deviceId) {
-    var overlay = document.getElementById('eagle-security-lock');
-    if (!overlay) {
-      overlay = document.createElement('div');
-      overlay.id = 'eagle-security-lock';
-      overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:#050505;z-index:999999;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;font-family:Arial,sans-serif; text-align:center;';
-      document.body.appendChild(overlay);
-    }
+    is_active, is_blocked, exp = row
+    country, flag = get_geo_info(ip)
     
-    if (type === 'checking') {
-      overlay.innerHTML = '<h1 style="color:#f3d27a; font-size:3rem; margin-bottom:15px;">جاري الاتصال بالسيرفر والتحقق من الاشتراك...</h1><p>يرجى الانتظار...</p>';
-      overlay.style.display = 'flex';
-    } else if (type === 'pending') {
-      overlay.innerHTML = '<h1 style="color:#d4af37; font-size:3.5rem; margin-bottom:15px; font-weight:900;">التطبيق بانتظار التفعيل</h1><h3 style="color:#aaa; font-size:1.5rem; margin-bottom:30px;">يرجى تزويد الإدارة برقم الجهاز التالي لتفعيل اشتراكك:</h3><div style="background:#111; border:3px dashed #d4af37; padding:20px 40px; border-radius:15px; font-size:3rem; font-weight:bold; letter-spacing:4px; color:#00ff88; box-shadow: 0 0 20px rgba(212,175,55,0.2);">' + deviceId + '</div><p style="color:#555; margin-top:30px; font-size:1.2rem;">Powered by THE EAGLE ©</p>';
-      overlay.style.display = 'flex';
-    } else if (type === 'blocked') {
-      overlay.innerHTML = '<h1 style="color:#ff4b4b; font-size:4rem; margin-bottom:20px; font-weight:900;">تم إيقاف الخدمة</h1><h3 style="color:#ccc; font-size:1.5rem;">هذا الجهاز محظور من قبل الإدارة.</h3><p style="color:#555; margin-top:20px;">Device ID: ' + deviceId + '</p>';
-      overlay.style.display = 'flex';
-    } else if (type === 'expired') {
-      overlay.innerHTML = '<h1 style="color:#ff8c00; font-size:4rem; margin-bottom:20px; font-weight:900;">انتهى الاشتراك</h1><h3 style="color:#ccc; font-size:1.5rem;">يرجى التواصل مع الإدارة لتجديد اشتراكك.</h3><p style="color:#555; margin-top:20px;">Device ID: ' + deviceId + '</p>';
-      overlay.style.display = 'flex';
-    } else if (type === 'error') {
-      overlay.innerHTML = '<h1 style="color:#ff4b4b; font-size:3.5rem; margin-bottom:15px;">خطأ في الاتصال بلوحة التحكم</h1><h3 style="color:#aaa; font-size:1.5rem;">التطبيق لا يستطيع الوصول لسيرفر التفعيل. تأكد من اتصالك بالانترنت.</h3><p style="color:#555; margin-top:30px;">Device ID: ' + deviceId + '</p><button onclick="window.location.reload()" style="margin-top:20px; padding:10px 20px; font-size:1.2rem; background:#d4af37; border:none; border-radius:5px; cursor:pointer;">إعادة المحاولة</button>';
-      overlay.style.display = 'flex';
-    } else if (type === 'active') {
-      overlay.style.display = 'none';
-      isAppUnlocked = true;
-      failedAttempts = 0; // تصفير العداد عند النجاح
+    c.execute(
+        "UPDATE devices SET last_seen=?, server=?, model=?, device_type=?, ip=?, country=?, flag=? WHERE device_id=?",
+        (now, server, model, device_type, ip, country, flag, device)
+    )
+    conn.commit()
+    conn.close()
+
+    if is_blocked:
+        return jsonify({"status": "blocked", "action": "wipe_data"})
+    if expired(exp):
+        return jsonify({"status": "expired"})
+    if not is_active:
+        return jsonify({"status": "pending"})
+    return jsonify({"status": "active"})
+
+@app.route("/admin")
+@requires_auth
+def admin():
+    conn = db()
+    c = conn.cursor()
+    c.execute("SELECT * FROM devices ORDER BY id DESC")
+    rows = c.fetchall()
+
+    total_devices = len(rows)
+    active_count = sum(1 for r in rows if r[10] == 1 and r[11] == 0 and not expired(r[12]))
+    blocked_count = sum(1 for r in rows if r[11] == 1)
+    pending_count = sum(1 for r in rows if r[10] == 0 and r[11] == 0)
+    expired_count = sum(1 for r in rows if expired(r[12]))
+
+    html = """
+    <html>
+    <head>
+    <title>Eagle IPTV Panel</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{background:linear-gradient(180deg,#020617 0%,#0f172a 100%);font-family:Arial,sans-serif;color:white;padding:25px;}
+    .container{max-width:1700px;margin:auto;}
+    .banner{width:100%;height:220px;object-fit:cover;border-radius:16px;margin-bottom:25px;box-shadow:0 0 30px rgba(255,215,0,0.18);border:1px solid rgba(255,215,0,0.18);}
+    .title{font-size:36px;font-weight:800;color:#f8d35e;margin-bottom:10px;text-shadow:0 0 18px rgba(255,215,0,0.18);}
+    .subtitle{color:#94a3b8;margin-bottom:25px;font-size:15px;}
+    .topbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:20px;flex-wrap:wrap;}
+    .search-box{flex:1;min-width:260px;}
+    .search-box input{width:100%;background:#0f172a;border:1px solid rgba(255,215,0,0.12);color:white;border-radius:12px;padding:12px 14px;outline:none;font-size:14px;}
+    .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:15px;margin-bottom:25px;}
+    .card{background:rgba(15,23,42,0.85);border:1px solid rgba(255,215,0,0.12);border-radius:14px;padding:18px;box-shadow:0 0 20px rgba(0,0,0,0.25);transition:0.25s ease;}
+    .card:hover{transform:translateY(-2px);border-color:rgba(255,215,0,0.28);}
+    .card h3{color:#94a3b8;font-size:14px;margin-bottom:10px;font-weight:600;}
+    .card p{color:#f8d35e;font-size:28px;font-weight:800;}
+    .table-wrap{overflow-x:auto;border-radius:16px;border:1px solid rgba(255,215,0,0.12);box-shadow:0 0 20px rgba(0,0,0,0.25);}
+    table{border-collapse:collapse;width:100%;min-width:1450px;background:rgba(15,23,42,0.92);}
+    th, td{padding:14px 12px;text-align:center;border-bottom:1px solid rgba(255,255,255,0.06);}
+    th{background:#16233a;color:#f8d35e;font-size:14px;position:sticky;top:0;}
+    tr:hover{background:rgba(255,255,255,0.03);}
+    .status{display:inline-block;min-width:95px;padding:7px 10px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:0.4px;}
+    .active{background:rgba(34,197,94,0.16);color:#4ade80;border:1px solid rgba(34,197,94,0.35);}
+    .blocked{background:rgba(239,68,68,0.16);color:#f87171;border:1px solid rgba(239,68,68,0.35);}
+    .pending{background:rgba(250,204,21,0.12);color:#facc15;border:1px solid rgba(250,204,21,0.35);}
+    .expired{background:rgba(249,115,22,0.16);color:#fb923c;border:1px solid rgba(249,115,22,0.35);}
+    .actions{display:flex;justify-content:center;align-items:center;flex-wrap:wrap;gap:8px;}
+    .btn{display:inline-block;padding:8px 12px;border-radius:10px;text-decoration:none;font-size:12px;font-weight:700;transition:0.2s ease;border:1px solid transparent;}
+    .btn:hover{transform:translateY(-1px);opacity:0.95;}
+    .btn-activate{background:#16a34a;color:white;}
+    .btn-block{background:#dc2626;color:white;}
+    .btn-extend{background:#d4af37;color:#111827;}
+    .btn-delete{background:#7f1d1d;color:white;}
+    .muted{color:#94a3b8;font-size:13px;}
+    .flag{font-size:18px; margin-right:5px;}
+    @media (max-width: 1200px){.stats{grid-template-columns:repeat(3,1fr);}}
+    @media (max-width: 900px){.stats{grid-template-columns:repeat(2,1fr);} .banner{height:150px;} .title{font-size:28px;}}
+    @media (max-width: 540px){.stats{grid-template-columns:1fr;} body{padding:14px;} .banner{height:110px;}}
+    </style>
+    <script>
+    function filterDevices() {
+        const input = document.getElementById("deviceSearch").value.toLowerCase();
+        const rows = document.querySelectorAll("tbody tr");
+        rows.forEach(row => {
+            row.style.display = row.innerText.toLowerCase().includes(input) ? "" : "none";
+        });
     }
-  }
+    </script>
+    </head>
+    <body>
+    <div class="container">
+    <img src="/banner.png" class="banner" alt="Eagle IPTV Panel Banner">
+    <div class="topbar">
+        <div>
+            <div class="title">Eagle IPTV Panel</div>
+            <div class="subtitle">Secure Device Management Dashboard</div>
+        </div>
+        <div class="search-box">
+            <input id="deviceSearch" onkeyup="filterDevices()" type="text" placeholder="Search by device, server, model, IP or country...">
+        </div>
+    </div>
 
-  function safeWipeData() {
-    var savedId = getEagleDeviceID(); 
-    try { localStorage.clear(); } catch(e) {}
-    localStorage.setItem('eagle_hardware_id', savedId); 
-    localStorage.setItem('device_id', savedId);
-  }
+    <div class="stats">
+        <div class="card"><h3>Total Devices</h3><p>__TOTAL__</p></div>
+        <div class="card"><h3>Active Devices</h3><p>__ACTIVE__</p></div>
+        <div class="card"><h3>Pending Devices</h3><p>__PENDING__</p></div>
+        <div class="card"><h3>Blocked Devices</h3><p>__BLOCKED__</p></div>
+        <div class="card"><h3>Expired Devices</h3><p>__EXPIRED__</p></div>
+    </div>
 
-  var deviceId = getEagleDeviceID();
-  handleSecurityScreen('checking', deviceId); 
+    <div class="table-wrap">
+    <table>
+    <thead>
+    <tr>
+        <th>ID</th>
+        <th>Device</th>
+        <th>Type & Details</th>
+        <th>Location</th>
+        <th>IP Address</th>
+        <th>Status</th>
+        <th>Expire</th>
+        <th>Created</th>
+        <th>Actions</th>
+    </tr>
+    </thead>
+    <tbody>
+    """
 
-  // دالة لمعالجة أخطاء الاتصال (Retry Logic)
-  function handleConnectionError() {
-      failedAttempts++;
-      if (failedAttempts < 3 && !isAppUnlocked) {
-          // لو فشل أقل من 3 مرات، جرب تاني بعد ثانيتين في صمت
-          setTimeout(sendEagleHeartbeat, 2000);
-      } else if (!isAppUnlocked) {
-          // لو فشل 3 مرات والتطبيق مقفول، أظهر رسالة الخطأ
-          handleSecurityScreen('error', deviceId);
-      }
-      // لو التطبيق كان مفتوح وشغال والنت قطع، مش هنعمل حاجة وهنسيبه يكمل الفرجة، وهنجرب تاني في النبضة اللي جاية
-  }
+    html = html.replace("__TOTAL__", str(total_devices))
+    html = html.replace("__ACTIVE__", str(active_count))
+    html = html.replace("__PENDING__", str(pending_count))
+    html = html.replace("__BLOCKED__", str(blocked_count))
+    html = html.replace("__EXPIRED__", str(expired_count))
 
-  function sendEagleHeartbeat() {
-    var serverName = getActiveServerName();
-    var nowPlaying = localStorage.getItem('eagle_now_playing') || localStorage.getItem('now_playing') || 'يتصفح القوائم...';
-    // إضافة رقم الإصدار للموديل عشان يظهر في لوحة التحكم
-    var deviceModel = getDeviceType() + " (v" + (window.EAGLE_APP_CONFIG.appVersion || "1.0") + ")";
+    for r in rows:
+        (
+            row_id,
+            device,
+            server,
+            model,
+            device_type,
+            ip,
+            country,
+            flag,
+            created,
+            last,
+            active,
+            blocked,
+            exp
+        ) = r
 
-    var xhr = new XMLHttpRequest();
-    var url = adminApiUrl + '?device=' + encodeURIComponent(deviceId) +
-              '&server=' + encodeURIComponent(serverName) +
-              '&playing=' + encodeURIComponent(nowPlaying) +
-              '&model=' + encodeURIComponent(deviceModel);
+        if blocked:
+            status_label = "BLOCKED"
+            status_class = "blocked"
+        elif expired(exp):
+            status_label = "EXPIRED"
+            status_class = "expired"
+        elif active:
+            status_label = "ACTIVE"
+            status_class = "active"
+        else:
+            status_label = "PENDING"
+            status_class = "pending"
 
-    xhr.onreadystatechange = function() {
-      if (xhr.readyState === 4) {
-        if (xhr.status === 200) {
-          try {
-            var response = JSON.parse(xhr.responseText);
-            
-            if (response.status === 'blocked' || response.action === 'wipe_data') {
-              safeWipeData();
-              handleSecurityScreen('blocked', deviceId);
-              isAppUnlocked = false;
-            } else if (response.status === 'pending') {
-              handleSecurityScreen('pending', deviceId);
-              isAppUnlocked = false;
-            } else if (response.status === 'expired') {
-              handleSecurityScreen('expired', deviceId);
-              isAppUnlocked = false;
-            } else if (response.status === 'active') {
-              handleSecurityScreen('active', deviceId);
-            }
-          } catch(e) {
-            handleConnectionError();
-          }
-        } else {
-          handleConnectionError();
-        }
-      }
-    };
-    xhr.onerror = function() { handleConnectionError(); };
-    try { xhr.open('GET', url, true); xhr.send(); } catch(e) { handleConnectionError(); }
-  }
+        type_model_display = f"<b>{device_type or 'Unknown'}</b><br><span class='muted'>{model or '-'}</span>"
+        location_display = f"<span class='flag'>{flag or '🏳️'}</span> {country or 'Unknown'}"
+        created_short = created.split('.')[0].replace('T', ' ') if created else "-"
 
-  setTimeout(sendEagleHeartbeat, 100);
-  heartbeatTimer = setInterval(sendEagleHeartbeat, 15000); 
+        html += f"""
+        <tr>
+            <td>{row_id}</td>
+            <td>{device}</td>
+            <td>{type_model_display}</td>
+            <td>{location_display}</td>
+            <td><b>{ip or "-"}</b></td>
+            <td><span class="status {status_class}">{status_label}</span></td>
+            <td>{exp.split('T')[0] if exp else "-"}</td>
+            <td class="muted">{created_short}</td>
+            <td>
+                <div class="actions">
+                    <a class="btn btn-activate" href="/activate?device={device}">Activate</a>
+                    <a class="btn btn-block" href="/block?device={device}">Block</a>
+                    <a class="btn btn-extend" href="/extend?device={device}&days=30">+30d</a>
+                    <a class="btn btn-delete" href="/delete?device={device}">Delete</a>
+                </div>
+            </td>
+        </tr>
+        """
 
-  window.EagleProtection = {
-    sendHeartbeat: sendEagleHeartbeat,
-    getDeviceId: getEagleDeviceID,
-    getServerName: getActiveServerName,
-    getDeviceType: getDeviceType
-  };
-})();
+    html += """
+    </tbody>
+    </table>
+    </div>
+    </div>
+    </body>
+    </html>
+    """
 
-// ==========================================
-// 3. THE EAGLE - Security & Control System
-// ==========================================
-window.EagleControl = {
-    getPin: function() { return localStorage.getItem('eagle_pin') || ''; },
-    setPin: function(pin) { localStorage.setItem('eagle_pin', pin); },
-    getHiddenCats: function() { return JSON.parse(localStorage.getItem('eagle_hidden_cats') || '[]'); },
-    toggleHideCat: function(catId) {
-        var hidden = this.getHiddenCats();
-        var idx = hidden.indexOf(catId);
-        if(idx > -1) hidden.splice(idx, 1);
-        else hidden.push(catId);
-        localStorage.setItem('eagle_hidden_cats', JSON.stringify(hidden));
-    },
-    getLockedCats: function() { return JSON.parse(localStorage.getItem('eagle_locked_cats') || '[]'); },
-    toggleLockCat: function(catId) {
-        var locked = this.getLockedCats();
-        var idx = locked.indexOf(catId);
-        if(idx > -1) locked.splice(idx, 1);
-        else locked.push(catId);
-        localStorage.setItem('eagle_locked_cats', JSON.stringify(locked));
-    },
-    clearCache: function() {
-        var keysToKeep = ['eagle_hardware_id', 'device_id', 'eagle_providers', 'active_server_key', 'active_server_full_data', 'active_server_title', 'eagle_lang', 'eagle_pin', 'eagle_hidden_cats', 'eagle_locked_cats', 'eagle_update_info'];
-        var dataToKeep = {};
-        keysToKeep.forEach(function(k) { dataToKeep[k] = localStorage.getItem(k); });
-        localStorage.clear();
-        keysToKeep.forEach(function(k) { if(dataToKeep[k]) localStorage.setItem(k, dataToKeep[k]); });
-    }
-};
+    conn.close()
+    return html
+
+@app.route("/activate")
+@requires_auth
+def activate():
+    device = request.args.get("device")
+    conn = db()
+    c = conn.cursor()
+    c.execute("UPDATE devices SET is_active=1, is_blocked=0 WHERE device_id=?", (device,))
+    conn.commit()
+    conn.close()
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
+
+@app.route("/block")
+@requires_auth
+def block():
+    device = request.args.get("device")
+    conn = db()
+    c = conn.cursor()
+    c.execute("UPDATE devices SET is_blocked=1, is_active=0 WHERE device_id=?", (device,))
+    conn.commit()
+    conn.close()
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
+
+@app.route("/extend")
+@requires_auth
+def extend():
+    device = request.args.get("device")
+    days = int(request.args.get("days", 30))
+    conn = db()
+    c = conn.cursor()
+    expire = datetime.datetime.utcnow() + datetime.timedelta(days=days)
+    c.execute("UPDATE devices SET expires_at=? WHERE device_id=?", (expire.isoformat(), device))
+    conn.commit()
+    conn.close()
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
+
+@app.route("/delete")
+@requires_auth
+def delete():
+    device = request.args.get("device")
+    conn = db()
+    c = conn.cursor()
+    c.execute("DELETE FROM devices WHERE device_id=?", (device,))
+    conn.commit()
+    conn.close()
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
+
+init_db()
