@@ -377,3 +377,9 @@ def delete():
     return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
 init_db()
+
+if __name__ == "__main__":
+    # Render بيحدد الـ Port أوتوماتيك من خلال متغير البيئة
+    port = int(os.environ.get("PORT", 10000))
+    # تشغيل السيرفر على العنوان العام 0.0.0.0
+    app.run(host="0.0.0.0", port=port)
