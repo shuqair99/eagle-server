@@ -458,7 +458,7 @@ def extend():
         conn.commit()
     finally:
         conn.close()
-    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html')
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
 
 @app.route("/delete")
@@ -472,7 +472,7 @@ def delete():
         conn.commit()
     finally:
         conn.close()
-    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html')
+    return Response('<script>window.location.href="/admin";</script>', mimetype="text/html")
 
 
 init_db()
